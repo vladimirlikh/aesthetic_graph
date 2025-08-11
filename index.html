@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Aesthetics Graph — Infinite Canvas</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <style>
+    html,body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#fff; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+    svg { width:100vw; height:100vh; display:block; touch-action:none; }
+    .link { stroke:#bfbfbf; stroke-opacity:.9; stroke-width:1px; vector-effect:non-scaling-stroke; visibility: hidden; }
+    .node circle { stroke:#fff; stroke-width:1.5px; vector-effect:non-scaling-stroke; }
+    .node text { fill:#000000; font-weight:800; text-anchor:middle; dominant-baseline:middle; pointer-events:none; paint-order:stroke; stroke:rgb(255, 255, 255); stroke-width:0px; }
+    .selected circle { stroke:#000; stroke-width:2px; }
+    .selected-link { stroke:#000 !important; stroke-width:2px !important; visibility: visible !important; }
+    .faded { opacity:.15; }
+    #status { position:fixed; left:8px; top:8px; z-index:20; background:#fff; border:1px solid #ddd; border-radius:10px; padding:6px 10px; font-size:12px; }
+    #searchBar { position:fixed; left:8px; top:46px; z-index:20; display:flex; gap:6px; background:#fff; border:1px solid #ddd; border-radius:10px; padding:6px 8px; align-items:center; }
+    #searchBar input { border:0; outline:none; font-size:14px; min-width:240px; }
+    #searchBar button { border:0; background:#111; color:#fff; padding:6px 10px; border-radius:8px; cursor:pointer; }
+    #panel { position:fixed; right:8px; top:8px; width:320px; max-width:45vw; max-height:85vh; overflow:auto; background:#fff; border:1px solid #ddd; border-radius:12px; padding:10px; box-shadow:0 8px 24px rgba(0,0,0,.08); z-index:30; display:none; }
+    #panel h3 { margin:0 0 8px 0; font-size:16px; }
+    #panel .meta { font-size:12px; color:#666; margin-bottom:8px; word-break:break-all; }
+    #panel .imgs { display:grid; grid-template-columns:repeat(2, 1fr); gap:6px; }
+    #panel .imgs img { width:100%; height:120px; object-fit:cover; border-radius:8px; background:#f3f3f3; }
+    #panel .actions { margin-top:8px; display:flex; gap:8px; }
+    #panel .actions a { text-decoration:none; background:#111; color:#fff; padding:6px 10px; border-radius:8px; font-size:13px; }
+  </style>
+</head>
+<body>
+  <div id="status">Loading…</div>
+  <div id="searchBar">
+    <input id="searchInput" type="search" placeholder="Search aesthetics…" />
+    <button id="searchClear">Clear</button>
+  </div>
+  <div id="panel"></div>
+  <svg></svg>
+  <script>
+    const MIN_RADIUS = 10;
+    const MAX_RADIUS = 600;
+    const LINK_DISTANCE_MULTIPLIER = 5.2;
+    const LINK_DISTANCE_OFFSET = 420;
+    const CHARGE_STRENGTH = -1400;
+    const COLLISION_PADDING = 90;
+
+    const svg = d3.select('svg');
+    const g = svg.append('g');
+    const BG_SIZE = 2e6;
+    g.insert('rect', ':first-child')
+      .attr('x', -BG_SIZE/2)
+      .attr('y', -BG_SIZE/2)
+      .attr('width', BG_SIZE)
+      .attr('height', BG_SIZE)
+      .attr('fill', 'transparent')
+      .on('click', () => resetSelection());
+
+    const linkG = g.append('g');
+    const nodeG = g.append('g');
+    const statusEl = document.getElementById('status');
+    const panelEl = document.getElementById('panel');
+    const searchInput = document.getElementById('searchInput');
+    const searchClear = document.getElementById('searchClear');
+    const ZOOM = d3.zoom().scaleExtent([0.05, 20]).translateExtent([[-1e9, -1e9], [1e9, 1e9]]).on('zoom', e => g.attr('transform', e.transform));
+    svg.call(ZOOM);
+
+    async function loadJSON(){
+      const tries = ['aesthetics_graph.json','../data/aesthetics_graph.json'];
+      for (const u of tries){
+        try { const r = await fetch(u + '?_=' + Date.now(), {cache:'no-store'}); if (r.ok) return {url:u, data:await r.json()}; } catch{}
+      }
+      throw new Error('aesthetics_graph.json not found');
+    }
+
+    const getId = v => (v && typeof v === 'object') ? v.id : v;
+    const slugFromUrl = (u) => {
+      try { const p = new URL(u).pathname; const parts = p.split('/').filter(Boolean); return parts[parts.length-1] || u; } catch { return u; }
+    };
+
+    function mergeGraphByUrl(raw){
+      const originalNodes = Array.isArray(raw.nodes) ? raw.nodes : [];
+      const originalLinks = Array.isArray(raw.links) ? raw.links : [];
+      const urlToGroup = new Map();
+      const idToUrl = new Map();
+      for (const n of originalNodes){
+        const url = n.url || '';
+        if (!urlToGroup.has(url)) urlToGroup.set(url, []);
+        urlToGroup.get(url).push(n);
+        idToUrl.set(n.id, url);
+      }
+
+      // Build merged nodes
+      const mergedNodes = [];
+      const urlToMergedId = new Map();
+      for (const [url, group] of urlToGroup.entries()){
+        if (group.length === 0) continue;
+        const mergedId = slugFromUrl(url) || group[0].id;
+        urlToMergedId.set(url, mergedId);
+        const titles = Array.from(new Set(group.map(g => g.title).filter(Boolean)));
+        const images = [];
+        const seenImg = new Set();
+        for (const g of group){
+          const arr = Array.isArray(g.images) ? g.images : [];
+          for (const src of arr){ if (!seenImg.has(src)){ seenImg.add(src); images.push(src); } }
+        }
+        mergedNodes.push({ id: mergedId, title: titles.join(', '), url, images, degree: 0 });
+      }
+
+      // Remap links to merged ids and dedupe
+      const edgeSet = new Set();
+      const mergedLinks = [];
+      for (const l of originalLinks){
+        const a0 = getId(l.source), b0 = getId(l.target);
+        const urlA = idToUrl.get(a0), urlB = idToUrl.get(b0);
+        if (!urlA || !urlB) continue;
+        const a = urlToMergedId.get(urlA), b = urlToMergedId.get(urlB);
+        if (!a || !b || a === b) continue;
+        const key = a < b ? (a + '|' + b) : (b + '|' + a);
+        if (edgeSet.has(key)) continue;
+        edgeSet.add(key);
+        mergedLinks.push({ source: a, target: b });
+      }
+
+      // Recompute degrees
+      const idToNode = new Map(mergedNodes.map(n => [n.id, n]));
+      for (const e of mergedLinks){
+        const a = idToNode.get(getId(e.source));
+        const b = idToNode.get(getId(e.target));
+        if (a) a.degree = (a.degree||0) + 1;
+        if (b) b.degree = (b.degree||0) + 1;
+      }
+
+      return { nodes: mergedNodes, links: mergedLinks };
+    }
+
+    function makeRadiusScale(nodes){
+      const vals = nodes.map(d => +d.degree || 0);
+      let min = Math.min(...vals), max = Math.max(...vals);
+      if (min === max) max = min + 1;
+      return d3.scaleSqrt().domain([min, max]).range([MIN_RADIUS, MAX_RADIUS]);
+    }
+
+    function makeColorScale(nodes){
+      const vals = nodes.map(d => +d.degree || 0);
+      let min = Math.min(...vals), max = Math.max(...vals);
+      if (min === max) max = min + 1;
+      const start = d3.color('#abc3ff'); // smallest
+      const end = d3.color('#ff0000');   // largest
+      const steps = d3.range(10).map(i => d3.interpolateRgb(start, end)(i / 9));
+      return d3.scaleQuantize().domain([min, max]).range(steps);
+    }
+
+    function fitFontSize(selection, rGet){
+      if(!window.__probe){
+        const ps = d3.select('body').append('svg').attr('width',0).attr('height',0).style('position','absolute');
+        window.__probe = ps.append('text').style('visibility','hidden');
+      }
+      selection.each(function(d){
+        const r = rGet(d);
+        let fs = Math.max(11, r * 0.9);
+        const maxW = r * 1.9;
+        const probe = window.__probe.text(d.title).attr('font-size', fs);
+        let w = probe.node().getComputedTextLength();
+        while (w > maxW && fs > 9) { fs *= 0.88; probe.attr('font-size', fs); w = probe.node().getComputedTextLength(); }
+        d3.select(this).attr('font-size', fs);
+      });
+    }
+
+    let selected = null;
+    let nodes = [];
+    let links = [];
+    let id2node = new Map();
+    let rScale, cScale;
+    let labelSel;
+    function resetSelection(){
+      selected = null;
+      if (nodeSel) nodeSel.classed('selected', false).classed('faded', false);
+      if (labelSel) labelSel.classed('faded', false);
+      if (linkSel) linkSel.classed('selected-link', false);
+      panelEl.style.display = 'none';
+    }
+
+    function highlightSelection(node){
+      if (!node) { resetSelection(); return; }
+      selected = node;
+      const sid = node.id;
+      const neigh = new Set([sid]);
+      for (const l of links){ const s=getId(l.source), t=getId(l.target); if (s===sid) neigh.add(t); if (t===sid) neigh.add(s); }
+      nodeSel.classed('selected', n => n.id===sid).classed('faded', n => !neigh.has(n.id));
+      if (linkSel) linkSel.classed('selected-link', l => { const a=getId(l.source), b=getId(l.target); return a===sid || b===sid; });
+    }
+
+    // multi-select removed
+
+    function positionLinks(){
+      if (!linkSel || linkSel.size() === 0) return;
+      linkSel
+        .attr('x1', d => (typeof d.source === 'object' ? d.source.x : (id2node.get(d.source)||{}).x))
+        .attr('y1', d => (typeof d.source === 'object' ? d.source.y : (id2node.get(d.source)||{}).y))
+        .attr('x2', d => (typeof d.target === 'object' ? d.target.x : (id2node.get(d.target)||{}).x))
+        .attr('y2', d => (typeof d.target === 'object' ? d.target.y : (id2node.get(d.target)||{}).y));
+    }
+
+    function setSelectedLinksFor(nodeId){
+      const selLinks = links.filter(l => getId(l.source)===nodeId || getId(l.target)===nodeId);
+      linkSel = linkG.selectAll('line').data(selLinks, d=>getId(d.source)+'|'+getId(d.target))
+                    .join('line').attr('class','link selected-link');
+      positionLinks();
+    }
+
+    function showPanel(node){
+      panelEl.innerHTML = '';
+      const title = document.createElement('h3');
+      const aliasText = Array.isArray(node.aliases) && node.aliases.length ? `, ${node.aliases.join(', ')}` : '';
+      title.textContent = (node.title || node.id) + aliasText;
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.textContent = node.url || '';
+      const imgsWrap = document.createElement('div');
+      imgsWrap.className = 'imgs';
+      const images = Array.isArray(node.images) ? node.images.slice(0,8) : [];
+      if (images.length === 0){
+        const p = document.createElement('div');
+        p.style.fontSize = '13px';
+        p.style.color = '#555';
+        p.textContent = 'No images';
+        imgsWrap.appendChild(p);
+      } else {
+        for (const src of images){
+          const img = document.createElement('img');
+          img.loading = 'lazy';
+          img.decoding = 'async';
+          img.referrerPolicy = 'no-referrer';   // improve hotlink success
+          img.crossOrigin = 'anonymous';        // harmless for <img>; helps if you later draw to canvas
+          img.src = src;
+          img.onerror = () => {
+            if (!img.__proxied) { img.__proxied = true; img.src = proxify(src); }
+          };
+          imgsWrap.appendChild(img);
+        }
+      }
+      const actions = document.createElement('div');
+      actions.className = 'actions';
+      const open = document.createElement('a');
+      open.href = node.url; open.target = '_blank'; open.rel = 'noopener noreferrer';
+      open.textContent = 'Open article';
+      actions.appendChild(open);
+      panelEl.appendChild(title);
+      panelEl.appendChild(meta);
+      panelEl.appendChild(imgsWrap);
+      panelEl.appendChild(actions);
+      panelEl.style.display = 'block';
+    }
+
+    function focusNodeById(nodeId){
+      const node = id2node.get(nodeId);
+      if (!node) return;
+      showPanel(node);
+      highlightSelection(node);
+    }
+
+    function search(query){
+      const q = (query||'').trim().toLowerCase();
+      if (!q){ resetSelection(); return; }
+      let found = nodes.find(n => (n.id||'').toLowerCase() === q)
+               || nodes.find(n => (n.title||'').toLowerCase().includes(q))
+               || nodes.find(n => Array.isArray(n.aliases) && n.aliases.some(a => (a||'').toLowerCase().includes(q)));
+      if (found){ focusNodeById(found.id); }
+    }
+
+    let linkSel, nodeSel;
+    (async function init(){
+      try{
+        const {url, data} = await loadJSON();
+        statusEl.textContent = `Loaded: ${url} · nodes=${data.nodes?.length||0} links=${data.links?.length||0}`;
+        if (!data.nodes?.length) return;
+        const {nodes: mergedNodes, links: mergedLinks} = mergeGraphByUrl(data);
+        nodes = mergedNodes;
+        links = mergedLinks;
+        id2node = new Map(nodes.map(n => [n.id, n]));
+        rScale = makeRadiusScale(nodes);
+        cScale = makeColorScale(nodes);
+
+        // Add nodes
+        nodeSel = nodeG.selectAll('circle').data(nodes, d=>d.id).join('circle')
+          .attr('r', d => rScale(d.degree))
+          .attr('fill', d => cScale(d.degree))
+          .attr('stroke', '#fff')
+          .attr('stroke-width', 1.5)
+          .attr('vector-effect', 'non-scaling-stroke')
+          .on('click', (event, d) => {
+            if (selected && selected.id === d.id) {
+              resetSelection();
+            } else {
+              showPanel(d);
+              highlightSelection(d);
+            }
+          });
+
+        // Add node labels
+        labelSel = nodeG.selectAll('text').data(nodes, d=>d.id).join('text')
+          .attr('fill', '#000000')
+          .attr('font-weight', 800)
+          .attr('text-anchor', 'middle')
+          .attr('dominant-baseline', 'middle')
+          .attr('pointer-events', 'none')
+          .attr('paint-order', 'stroke')
+          .attr('stroke', 'rgb(255, 255, 255)')
+          .attr('stroke-width', 0)
+          .text(d => d.title);
+        labelSel.call(sel => fitFontSize(sel, d => rScale(d.degree)));
+
+        // Add links
+        linkSel = linkG.selectAll('line').data(links).join('line')
+          .attr('class', 'link')
+          .attr('stroke', '#bfbfbf')
+          .attr('stroke-opacity', 0.9)
+          .attr('stroke-width', 1)
+          .attr('vector-effect', 'non-scaling-stroke')
+          .attr('visibility', 'visible');
+
+        // Force simulation to spread nodes
+        const sim = d3.forceSimulation(nodes)
+          .force('link', d3.forceLink(links).id(d => d.id)
+            .distance(l => {
+              const s = id2node.get(getId(l.source));
+              const t = id2node.get(getId(l.target));
+              const rs = rScale((s && typeof s.degree === 'number') ? s.degree : 0);
+              const rt = rScale((t && typeof t.degree === 'number') ? t.degree : 0);
+              const r = Math.max(rs, rt);
+              return LINK_DISTANCE_MULTIPLIER * r + LINK_DISTANCE_OFFSET;
+            })
+            .strength(0.08))
+          .force('charge', d3.forceManyBody().strength(CHARGE_STRENGTH))
+          .force('collide', d3.forceCollide().radius(d => rScale((d && typeof d.degree === 'number') ? d.degree : 0) + COLLISION_PADDING).strength(1))
+          .force('center', d3.forceCenter(0, 0))
+          .alpha(1)
+          .alphaDecay(0.022)
+          .velocityDecay(0.35);
+
+        sim.on('tick', () => {
+          linkSel
+            .attr('x1', d => (d.source && typeof d.source === 'object' ? d.source.x : (id2node.get(getId(d.source))||{}).x))
+            .attr('y1', d => (d.source && typeof d.source === 'object' ? d.source.y : (id2node.get(getId(d.source))||{}).y))
+            .attr('x2', d => (d.target && typeof d.target === 'object' ? d.target.x : (id2node.get(getId(d.target))||{}).x))
+            .attr('y2', d => (d.target && typeof d.target === 'object' ? d.target.y : (id2node.get(getId(d.target))||{}).y));
+          nodeSel
+            .attr('cx', d => d.x)
+            .attr('cy', d => d.y);
+          labelSel
+            .attr('x', d => d.x)
+            .attr('y', d => d.y);
+        });
+
+        resetSelection();
+
+        // Add search functionality
+        searchInput.addEventListener('input', () => search(searchInput.value));
+        searchClear.addEventListener('click', () => { searchInput.value = ''; search(''); });
+
+        // Add panel functionality
+        panelEl.addEventListener('click', () => {
+          if (panelEl.style.display === 'block') {
+            panelEl.style.display = 'none';
+          } else {
+            panelEl.style.display = 'block';
+          }
+        });
+
+        // Add panel content
+        panelEl.innerHTML = ''; // Clear any previous content
+        const title = document.createElement('h3');
+        title.textContent = 'Aesthetics Graph';
+        panelEl.appendChild(title);
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        meta.textContent = 'Click on a node to focus and view details.';
+        panelEl.appendChild(meta);
+        const imgsWrap = document.createElement('div');
+        imgsWrap.className = 'imgs';
+        const p = document.createElement('div');
+        p.style.fontSize = '13px';
+        p.style.color = '#555';
+        p.textContent = 'Click on a node to view details.';
+        imgsWrap.appendChild(p);
+        panelEl.appendChild(imgsWrap);
+        const actions = document.createElement('div');
+        actions.className = 'actions';
+        const openAll = document.createElement('a');
+        openAll.href = '#';
+        openAll.textContent = 'Open All Articles';
+        openAll.onclick = () => {
+          nodes.forEach(node => {
+            if (node.url) {
+              window.open(node.url, '_blank');
+            }
+          });
+        };
+        actions.appendChild(openAll);
+        panelEl.appendChild(actions);
+
+      } catch (error) {
+        statusEl.textContent = `Error: ${error.message}`;
+        console.error(error);
+      }
+    })();
+  </script>
+</body>
+</html>
